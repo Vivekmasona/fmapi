@@ -1,80 +1,81 @@
-import express from "express";
-import { WebSocketServer } from "ws";
-import http from "http";
+// server.js
+const express = require("express");
+const http = require("http");
+const { WebSocketServer } = require("ws");
+const crypto = require("crypto");
 
 const app = express();
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-const rooms = {}; // { roomID: { members: Set<WebSocket>, broadcaster: WebSocket | null } }
+app.use(express.static("public")); // serve HTML from public/
 
-app.get("/", (_, res) => res.send("🎧 BiharFM Mini Room Signaling Server Active"));
+// Rooms: { roomId: { host: ws, listeners: [ws, ...] } }
+const rooms = {};
 
 wss.on("connection", (ws) => {
+  ws.id = crypto.randomUUID();
+  ws.roomId = null;
+  ws.role = null;
+
   ws.on("message", (msg) => {
     try {
       const data = JSON.parse(msg);
-      const { type, roomID, payload } = data;
-
-      if (type === "join-room") {
-        if (!rooms[roomID]) rooms[roomID] = { members: new Set(), broadcaster: null };
-
-        if (rooms[roomID].members.size >= 4) {
-          ws.send(JSON.stringify({ type: "room-full" }));
-          return;
-        }
-
-        ws.roomID = roomID;
-        rooms[roomID].members.add(ws);
-        console.log(`✅ ${roomID} joined (${rooms[roomID].members.size}/4)`);
-
-        broadcast(roomID, {
-          type: "update-count",
-          count: rooms[roomID].members.size,
-        });
-      }
-
-      // Set broadcaster
-      if (type === "set-broadcaster") {
-        if (rooms[roomID]) rooms[roomID].broadcaster = ws;
-        console.log(`🎙️ Broadcaster set for room ${roomID}`);
-      }
-
-      // Broadcast play/pause commands
-      if (["play", "pause"].includes(type)) {
-        broadcast(roomID, { type }, ws);
-      }
-
-      // Forward signaling offers/answers
-      if (["offer", "answer", "candidate"].includes(type)) {
-        broadcast(roomID, { type, payload }, ws);
-      }
-    } catch (e) {
-      console.error("Bad WS message", e);
-    }
+      handleMessage(ws, data);
+    } catch (e) { console.warn("Invalid JSON", e); }
   });
 
   ws.on("close", () => {
-    const roomID = ws.roomID;
-    if (roomID && rooms[roomID]) {
-      rooms[roomID].members.delete(ws);
-      if (rooms[roomID].members.size === 0) delete rooms[roomID];
-      else {
-        broadcast(roomID, {
-          type: "update-count",
-          count: rooms[roomID].members.size,
-        });
-      }
+    if (!ws.roomId) return;
+    const room = rooms[ws.roomId];
+    if (!room) return;
+    if (ws.role === "host") {
+      // Close room
+      room.listeners.forEach(l => l.send(JSON.stringify({ type:"host-left" })));
+      delete rooms[ws.roomId];
+    } else if (ws.role === "listener") {
+      room.listeners = room.listeners.filter(l => l.id !== ws.id);
+      if (room.host) room.host.send(JSON.stringify({ type:"listener-left", id: ws.id }));
     }
   });
 });
 
-function broadcast(roomID, msg, exclude = null) {
-  if (!rooms[roomID]) return;
-  const str = JSON.stringify(msg);
-  for (const c of rooms[roomID].members) {
-    if (c.readyState === 1 && c !== exclude) c.send(str);
+function handleMessage(ws, msg) {
+  if (msg.type === "register") {
+    const { role, room } = msg;
+    ws.role = role;
+    ws.roomId = room;
+
+    if (!rooms[room]) rooms[room] = { host: null, listeners: [] };
+    const roomObj = rooms[room];
+
+    if (role === "host") {
+      if (roomObj.host) return ws.send(JSON.stringify({ type:"error", message:"Room already has host" }));
+      roomObj.host = ws;
+      ws.send(JSON.stringify({ type:"registered", role:"host" }));
+    } else if (role === "listener") {
+      if (!roomObj.host) return ws.send(JSON.stringify({ type:"error", message:"No host in room yet" }));
+      if (roomObj.listeners.length >= 3) return ws.send(JSON.stringify({ type:"error", message:"Room full" }));
+      roomObj.listeners.push(ws);
+      ws.send(JSON.stringify({ type:"registered", role:"listener" }));
+      // Notify host
+      roomObj.host.send(JSON.stringify({ type:"listener-joined", id: ws.id }));
+    }
+  }
+
+  // Forward SDP/candidates
+  if (["offer","answer","candidate","metadata"].includes(msg.type)) {
+    const roomObj = rooms[ws.roomId];
+    if (!roomObj) return;
+    if (ws.role === "host") {
+      // send to specific listener
+      const target = roomObj.listeners.find(l => l.id === msg.target);
+      if (target) target.send(JSON.stringify(msg));
+    } else if (ws.role === "listener") {
+      if (roomObj.host) roomObj.host.send(JSON.stringify({ ...msg, from: ws.id }));
+    }
   }
 }
 
-server.listen(3000, () => console.log("🚀 Server running on port 3000"));
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () => console.log(`🚀 Server running on port ${PORT}`));
