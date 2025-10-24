@@ -1,7 +1,7 @@
-const express = require("express");
-const http = require("http");
-const { WebSocketServer } = require("ws");
-const crypto = require("crypto");
+import express from "express";
+import http from "http";
+import { WebSocketServer } from "ws";
+import crypto from "crypto";
 
 const app = express();
 
