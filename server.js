@@ -7,80 +7,86 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-const rooms = new Map(); // roomId => { broadcasterId, listeners: Map<id, ws> }
+// Rooms structure
+// rooms = {
+//   roomId1: { broadcaster: connId, listeners: Set(connId) },
+//   roomId2: ...
+// }
+const rooms = new Map();
+const conns = new Map();
 
 app.get("/", (req, res) => {
-  res.send("🎧 FM Room WS Server running");
+  res.setHeader("Access-Control-Allow-Origin", "*");
+  res.send("🎧 FM Room Server Active");
 });
 
 wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
-  let role = null;
-  let roomId = null;
+  const conn = { id, ws, role: null, room: null };
+  conns.set(id, conn);
+  console.log("🟢 Conn open", id);
 
   ws.on("message", (data) => {
     try {
       const msg = JSON.parse(data);
+      const { type, role, room, target, payload } = msg;
 
-      // --- Register role + room ---
-      if (msg.type === "register") {
-        role = msg.role;
-        roomId = msg.room || "default";
-        if (!rooms.has(roomId)) rooms.set(roomId, { broadcasterId: null, listeners: new Map() });
+      if (type === "join-room") {
+        if (!room) return ws.send(JSON.stringify({ type: "error", message: "Room required" }));
+        
+        conn.room = room;
+        conn.role = role;
 
-        const room = rooms.get(roomId);
+        if (!rooms.has(room)) rooms.set(room, { broadcaster: null, listeners: new Set() });
+        const r = rooms.get(room);
+
+        // Assign broadcaster
         if (role === "broadcaster") {
-          room.broadcasterId = id;
-
-          // Notify broadcaster about already ready listeners
-          for (const [lId, lWs] of room.listeners) {
-            if (room.listeners.has(lId)) {
-              ws.send(JSON.stringify({ type: "listener-ready", id: lId }));
-            }
-          }
-        } else if (role === "listener") {
-          room.listeners.set(id, ws);
-
-          // Notify broadcaster if already online
-          if (room.broadcasterId) {
-            const bWs = wss.clientsArray?.find(c => c.id === room.broadcasterId) || null;
-            if (bWs && bWs.readyState === 1) {
-              bWs.send(JSON.stringify({ type: "listener-joined", id }));
-            }
-          }
+          if (r.broadcaster) return ws.send(JSON.stringify({ type: "error", message: "Broadcaster exists" }));
+          r.broadcaster = id;
+          ws.send(JSON.stringify({ type: "joined", room, role }));
+          console.log(`Room ${room}: broadcaster joined (${id})`);
+          return;
         }
+
+        // Assign listener (max 3)
+        if (role === "listener") {
+          if (r.listeners.size >= 3) return ws.send(JSON.stringify({ type: "error", message: "Room full" }));
+          r.listeners.add(id);
+          ws.send(JSON.stringify({ type: "joined", room, role }));
+          console.log(`Room ${room}: listener joined (${id})`);
+
+          // Notify broadcaster
+          if (r.broadcaster && conns.has(r.broadcaster)) {
+            conns.get(r.broadcaster).ws.send(JSON.stringify({ type: "listener-joined", id }));
+          }
+          return;
+        }
+      }
+
+      // WebRTC signaling (offer/answer/candidate)
+      if (type === "offer" || type === "answer" || type === "candidate") {
+        const t = conns.get(target);
+        if (t) t.ws.send(JSON.stringify({ type, from: id, payload }));
         return;
       }
 
-      // --- Forward signaling messages ---
-      if (["offer", "answer", "candidate"].includes(msg.type)) {
-        const room = rooms.get(roomId);
-        if (!room) return;
-
-        let targetWs = null;
-        if (msg.target) {
-          if (msg.type === "offer" || msg.type === "answer" || msg.type === "candidate") {
-            if (room.listeners.has(msg.target)) targetWs = room.listeners.get(msg.target);
-            else if (room.broadcasterId === msg.target) targetWs = ws;
-          }
-        }
-
-        if (targetWs && targetWs.readyState === 1) targetWs.send(JSON.stringify({ ...msg, from: id }));
-      }
     } catch (err) {
-      console.error(err);
+      console.error("❌ Message parse error", err);
     }
   });
 
   ws.on("close", () => {
-    if (!roomId) return;
-    const room = rooms.get(roomId);
-    if (!room) return;
-
-    if (role === "listener") room.listeners.delete(id);
-    if (role === "broadcaster") room.broadcasterId = null;
+    const { room, role } = conn;
+    conns.delete(id);
+    if (room && rooms.has(room)) {
+      const r = rooms.get(room);
+      if (role === "broadcaster") r.broadcaster = null;
+      if (role === "listener") r.listeners.delete(id);
+    }
+    console.log("🔴 Conn closed", id);
   });
 });
 
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log("✅ Server running on port", PORT));
+server.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
