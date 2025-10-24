@@ -7,128 +7,122 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Rooms: roomId -> { hostId: string|null, listeners: Set<id>, currentTrackIndex: number, currentTime: number }
-const rooms = new Map();
-const conns = new Map();
+const rooms = new Map(); // roomId => { hostId, listeners: Set, hostWS }
 
-app.get("/", (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
+app.get("/", (req,res)=>{
   res.send("🎧 Room-based FM signaling server");
 });
 
-wss.on("connection", (ws) => {
+wss.on("connection",(ws)=>{
   const id = crypto.randomUUID();
-  const conn = { id, ws, role: null, room: null };
-  conns.set(id, conn);
-  console.log("🟢 Connection open", id);
+  let roomId = null;
+  let role = null;
 
-  ws.on("message", (data) => {
+  ws.on("message",(msg)=>{
     try {
-      const msg = JSON.parse(data);
+      const data = JSON.parse(msg);
 
-      if (msg.type === "register") {
-        const { role, room } = msg;
-        conn.role = role;
-        conn.room = room;
+      // --- Register ---
+      if(data.type==="register"){
+        role = data.role;
+        roomId = data.room || "default";
+        if(!rooms.has(roomId)) rooms.set(roomId,{ hostId:null, listeners:new Set(), hostWS:null });
 
-        if (!rooms.has(room)) rooms.set(room, { hostId: null, listeners: new Set(), currentTrackIndex: 0, currentTime: 0 });
-        const roomData = rooms.get(room);
+        const room = rooms.get(roomId);
 
-        if (role === "broadcaster") {
-          if (roomData.hostId) {
-            ws.send(JSON.stringify({ type: "reject", reason: "Host already exists" }));
+        if(role==="host"){
+          if(room.hostId){
+            ws.send(JSON.stringify({ type:"reject", reason:"Host already exists" }));
             ws.close();
             return;
           }
-          roomData.hostId = id;
-          ws.send(JSON.stringify({ type: "registered", role, room }));
-          console.log(`Host ${id} registered in room ${room}`);
-        } else if (role === "listener") {
-          if (!roomData.hostId) {
-            ws.send(JSON.stringify({ type: "reject", reason: "No host in room" }));
+          room.hostId = id;
+          room.hostWS = ws;
+          ws.send(JSON.stringify({ type:"registered", role:"host", room:roomId }));
+          // Late listeners: send track sync request
+          room.listeners.forEach(listenerId=>{
+            const conn = Array.from(wss.clients).find(c=>c.id===listenerId);
+            if(conn && conn.readyState===WebSocket.OPEN){
+              ws.send(JSON.stringify({ type:"request-track-sync", target:listenerId }));
+            }
+          });
+        }
+
+        if(role==="listener"){
+          if(room.listeners.size>=3){
+            ws.send(JSON.stringify({ type:"reject", reason:"Room full" }));
             ws.close();
             return;
           }
-          if (roomData.listeners.size >= 3) {
-            ws.send(JSON.stringify({ type: "reject", reason: "Room full (3 listeners max)" }));
-            ws.close();
-            return;
-          }
-          roomData.listeners.add(id);
-          ws.send(JSON.stringify({ type: "registered", role, room }));
-          console.log(`Listener ${id} joined room ${room}`);
-
-          // Notify host
-          const hostConn = conns.get(roomData.hostId);
-          if (hostConn && hostConn.ws.readyState === WebSocket.OPEN) {
-            hostConn.ws.send(JSON.stringify({ type: "listener-joined", id }));
-            // Late join sync: send current track info
-            hostConn.ws.send(JSON.stringify({ type:"request-track-sync", target: id }));
+          room.listeners.add(id);
+          ws.send(JSON.stringify({ type:"registered", role:"listener", room:roomId }));
+          // Notify host if exists
+          if(room.hostWS && room.hostWS.readyState===WebSocket.OPEN){
+            room.hostWS.send(JSON.stringify({ type:"listener-joined", id }));
+          } else {
+            // waiting for host
+            ws.send(JSON.stringify({ type:"waiting-host" }));
           }
         }
-        return;
+
+        ws.id = id;
+        ws.roomId = roomId;
       }
 
-      // Forward signaling messages
-      const { type, target, payload } = msg;
-      if (type === "offer" || type === "answer" || type === "candidate") {
-        const t = conns.get(target);
-        if (t && t.ws.readyState === WebSocket.OPEN) {
-          t.ws.send(JSON.stringify({ type, from: id, payload }));
+      // --- Offer/Answer/Candidate Relay ---
+      if(["offer","answer","candidate"].includes(data.type)){
+        const room = rooms.get(roomId);
+        let targetWS = null;
+        if(data.target){
+          if(room.hostId===data.target) targetWS = room.hostWS;
+          else if(room.listeners.has(data.target)){
+            targetWS = Array.from(wss.clients).find(c=>c.id===data.target);
+          }
+        }
+        if(targetWS && targetWS.readyState===WebSocket.OPEN){
+          targetWS.send(JSON.stringify({ ...data, from:id }));
         }
       }
 
-      // Broadcast track info from host
-      if (msg.type === "track-update") {
-        const roomData = rooms.get(conn.room);
-        if(roomData){
-          roomData.currentTrackIndex = msg.trackIndex || 0;
-          roomData.currentTime = msg.currentTime || 0;
-        }
-      }
-
-      // Send track sync to late listener
-      if(msg.type === "track-sync" && msg.target){
-        const t = conns.get(msg.target);
-        if(t && t.ws.readyState === WebSocket.OPEN){
-          t.ws.send(JSON.stringify({ type:"track-sync", payload: msg.payload }));
-        }
-      }
-
-    } catch (err) {
-      console.error("❌ Message parse error", err);
-    }
-  });
-
-  ws.on("close", () => {
-    console.log("🔴 Connection closed", id);
-    conns.delete(id);
-    if(conn.room && rooms.has(conn.room)){
-      const roomData = rooms.get(conn.room);
-      if(conn.role==="broadcaster"){
-        roomData.hostId = null;
-        // Disconnect all listeners
-        roomData.listeners.forEach(lid=>{
-          const lconn = conns.get(lid);
-          if(lconn && lconn.ws.readyState===WebSocket.OPEN){
-            lconn.ws.send(JSON.stringify({ type:"host-left" }));
-            lconn.ws.close();
+      // --- Broadcast control ---
+      if(data.type==="broadcast-control"){
+        const room = rooms.get(roomId);
+        room.listeners.forEach(listenerId=>{
+          const conn = Array.from(wss.clients).find(c=>c.id===listenerId);
+          if(conn && conn.readyState===WebSocket.OPEN){
+            conn.send(JSON.stringify({ type:"control", payload:data.payload }));
           }
         });
-        roomData.listeners.clear();
-      } else if(conn.role==="listener"){
-        roomData.listeners.delete(id);
-        if(roomData.hostId){
-          const hostConn = conns.get(roomData.hostId);
-          if(hostConn && hostConn.ws.readyState===WebSocket.OPEN){
-            hostConn.ws.send(JSON.stringify({ type:"peer-left", id }));
-          }
-        }
       }
-      if(!roomData.hostId && roomData.listeners.size===0) rooms.delete(conn.room);
+
+    } catch(e){
+      console.warn("Invalid WS message", e);
     }
   });
-});
 
+  ws.on("close",()=>{
+    const room = rooms.get(roomId);
+    if(!room) return;
+
+    if(role==="host"){
+      room.hostId = null;
+      room.hostWS = null;
+      // Notify all listeners
+      room.listeners.forEach(listenerId=>{
+        const conn = Array.from(wss.clients).find(c=>c.id===listenerId);
+        if(conn && conn.readyState===WebSocket.OPEN){
+          conn.send(JSON.stringify({ type:"host-left" }));
+        }
+      });
+    }
+    if(role==="listener"){
+      room.listeners.delete(id);
+      if(room.hostWS && room.hostWS.readyState===WebSocket.OPEN){
+        room.hostWS.send(JSON.stringify({ type:"peer-left", id }));
+      }
+    }
+  });
+
+});
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, ()=> console.log(`✅ Server running on port ${PORT}`));
+server.listen(PORT,()=>console.log("✅ Server running on port",PORT));
