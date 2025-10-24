@@ -7,60 +7,80 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-const conns = new Map(); // id -> {id, ws, role, room, ready}
+const rooms = new Map(); // roomId => { broadcasterId, listeners: Map<id, ws> }
 
-// CORS for testing
 app.get("/", (req, res) => {
-  res.send("🎧 Bihar FM WebSocket signaling server");
+  res.send("🎧 FM Room WS Server running");
 });
 
 wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
-  const conn = { id, ws, role: null, room: null, ready: false };
-  conns.set(id, conn);
-  console.log("🟢 Connection:", id);
+  let role = null;
+  let roomId = null;
 
   ws.on("message", (data) => {
     try {
       const msg = JSON.parse(data);
-      const { type, role, room, target, payload } = msg;
 
-      // --- Register / Join room ---
-      if(type === "join-room") {
-        conn.role = role;
-        conn.room = room;
-        if(role === "listener") conn.ready = true;
+      // --- Register role + room ---
+      if (msg.type === "register") {
+        role = msg.role;
+        roomId = msg.room || "default";
+        if (!rooms.has(roomId)) rooms.set(roomId, { broadcasterId: null, listeners: new Map() });
 
-        // notify broadcaster in same room that listener is ready
-        for(const c of conns.values()){
-          if(c.role==="broadcaster" && c.room===room){
-            c.ws.send(JSON.stringify({ type:"listener-ready", id:conn.id }));
+        const room = rooms.get(roomId);
+        if (role === "broadcaster") {
+          room.broadcasterId = id;
+
+          // Notify broadcaster about already ready listeners
+          for (const [lId, lWs] of room.listeners) {
+            if (room.listeners.has(lId)) {
+              ws.send(JSON.stringify({ type: "listener-ready", id: lId }));
+            }
+          }
+        } else if (role === "listener") {
+          room.listeners.set(id, ws);
+
+          // Notify broadcaster if already online
+          if (room.broadcasterId) {
+            const bWs = wss.clientsArray?.find(c => c.id === room.broadcasterId) || null;
+            if (bWs && bWs.readyState === 1) {
+              bWs.send(JSON.stringify({ type: "listener-joined", id }));
+            }
           }
         }
         return;
       }
 
-      // --- WebRTC signaling ---
-      if(["offer","answer","candidate"].includes(type)){
-        const t = conns.get(target);
-        if(t) t.ws.send(JSON.stringify({...msg, from:id}));
-        return;
-      }
+      // --- Forward signaling messages ---
+      if (["offer", "answer", "candidate"].includes(msg.type)) {
+        const room = rooms.get(roomId);
+        if (!room) return;
 
-    } catch(e){ console.error("❌ Message parse error", e); }
+        let targetWs = null;
+        if (msg.target) {
+          if (msg.type === "offer" || msg.type === "answer" || msg.type === "candidate") {
+            if (room.listeners.has(msg.target)) targetWs = room.listeners.get(msg.target);
+            else if (room.broadcasterId === msg.target) targetWs = ws;
+          }
+        }
+
+        if (targetWs && targetWs.readyState === 1) targetWs.send(JSON.stringify({ ...msg, from: id }));
+      }
+    } catch (err) {
+      console.error(err);
+    }
   });
 
   ws.on("close", () => {
-    conns.delete(id);
-    console.log("🔴 Connection closed:", id);
-    // notify broadcaster if listener left
-    for(const c of conns.values()){
-      if(c.role==="broadcaster" && c.room === conn.room){
-        c.ws.send(JSON.stringify({ type:"peer-left", id }));
-      }
-    }
+    if (!roomId) return;
+    const room = rooms.get(roomId);
+    if (!room) return;
+
+    if (role === "listener") room.listeners.delete(id);
+    if (role === "broadcaster") room.broadcasterId = null;
   });
 });
 
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, ()=>console.log(`✅ Server running on port ${PORT}`));
+server.listen(PORT, () => console.log("✅ Server running on port", PORT));
