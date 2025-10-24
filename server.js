@@ -1,97 +1,66 @@
-// server.js
 import express from "express";
 import { createServer } from "http";
 import { WebSocketServer } from "ws";
+import crypto from "crypto";
 
 const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
+const conns = new Map(); // id -> {id, ws, role, room, ready}
+
+// CORS for testing
 app.get("/", (req, res) => {
-  res.send("FM Room Signaling Server ✅");
+  res.send("🎧 Bihar FM WebSocket signaling server");
 });
 
-// Rooms: { roomId: { broadcaster: ws, listeners: [ws,...] } }
-const rooms = {};
-
 wss.on("connection", (ws) => {
-  ws.roomId = null;
-  ws.role = null;
+  const id = crypto.randomUUID();
+  const conn = { id, ws, role: null, room: null, ready: false };
+  conns.set(id, conn);
+  console.log("🟢 Connection:", id);
 
-  ws.on("message", (msg) => {
-    let data;
-    try { data = JSON.parse(msg); } catch(e){ return; }
+  ws.on("message", (data) => {
+    try {
+      const msg = JSON.parse(data);
+      const { type, role, room, target, payload } = msg;
 
-    const { type, role, room, target, payload } = data;
+      // --- Register / Join room ---
+      if(type === "join-room") {
+        conn.role = role;
+        conn.room = room;
+        if(role === "listener") conn.ready = true;
 
-    if(type==="join-room"){
-      ws.roomId = room;
-      ws.role = role;
-      if(!rooms[room]) rooms[room] = { broadcaster: null, listeners: [] };
-
-      const r = rooms[room];
-
-      if(role==="broadcaster"){
-        if(r.broadcaster){
-          ws.send(JSON.stringify({ type:"error", msg:"Room already has broadcaster" }));
-          ws.close();
-          return;
+        // notify broadcaster in same room that listener is ready
+        for(const c of conns.values()){
+          if(c.role==="broadcaster" && c.room===room){
+            c.ws.send(JSON.stringify({ type:"listener-ready", id:conn.id }));
+          }
         }
-        r.broadcaster = ws;
-
-        // Notify existing listeners of late join
-        r.listeners.forEach(lis => lis.send(JSON.stringify({ type:"offer-request" })));
-
-      } else if(role==="listener"){
-        if(r.listeners.length>=3){
-          ws.send(JSON.stringify({ type:"error", msg:"Room full" }));
-          ws.close();
-          return;
-        }
-        r.listeners.push(ws);
-
-        // If broadcaster already exists, notify to send offer
-        if(r.broadcaster){
-          r.broadcaster.send(JSON.stringify({ type:"new-listener" }));
-        }
-      }
-      return;
-    }
-
-    // Signaling messages
-    if(type==="offer" || type==="answer" || type==="candidate"){
-      const r = rooms[ws.roomId];
-      if(!r) return;
-      let dest = null;
-
-      if(ws.role==="broadcaster" && type==="offer"){
-        // Send offer to listener
-        dest = r.listeners.find(l => l.id===target);
-      } else if(ws.role==="listener" && type==="answer"){
-        dest = r.broadcaster;
-      } else if(type==="candidate"){
-        if(ws.role==="broadcaster") dest = r.listeners.find(l => l.id===target);
-        else if(ws.role==="listener") dest = r.broadcaster;
+        return;
       }
 
-      if(dest) dest.send(JSON.stringify({ type, from: ws.id, payload }));
-    }
+      // --- WebRTC signaling ---
+      if(["offer","answer","candidate"].includes(type)){
+        const t = conns.get(target);
+        if(t) t.ws.send(JSON.stringify({...msg, from:id}));
+        return;
+      }
+
+    } catch(e){ console.error("❌ Message parse error", e); }
   });
 
   ws.on("close", () => {
-    const r = rooms[ws.roomId];
-    if(!r) return;
-
-    if(ws.role==="broadcaster") {
-      r.broadcaster = null;
-      // Notify listeners
-      r.listeners.forEach(lis => lis.send(JSON.stringify({ type:"broadcaster-left" })));
-    } else if(ws.role==="listener"){
-      r.listeners = r.listeners.filter(l=>l!==ws);
-      if(r.broadcaster) r.broadcaster.send(JSON.stringify({ type:"listener-left" }));
+    conns.delete(id);
+    console.log("🔴 Connection closed:", id);
+    // notify broadcaster if listener left
+    for(const c of conns.values()){
+      if(c.role==="broadcaster" && c.room === conn.room){
+        c.ws.send(JSON.stringify({ type:"peer-left", id }));
+      }
     }
   });
 });
 
 const PORT = process.env.PORT || 8080;
-server.listen(PORT, ()=> console.log(`Server running on ${PORT}`));
+server.listen(PORT, ()=>console.log(`✅ Server running on port ${PORT}`));
