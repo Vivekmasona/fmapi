@@ -8,9 +8,8 @@ const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
 // Rooms structure
-// rooms = {
-//   roomId1: { broadcaster: connId, listeners: Set(connId) },
-//   roomId2: ...
+// rooms = Map {
+//   roomId => { broadcaster: connId, listeners: Set(connId) }
 // }
 const rooms = new Map();
 const conns = new Map();
@@ -20,6 +19,7 @@ app.get("/", (req, res) => {
   res.send("🎧 FM Room Server Active");
 });
 
+// WebSocket connection
 wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
   const conn = { id, ws, role: null, room: null };
@@ -31,16 +31,16 @@ wss.on("connection", (ws) => {
       const msg = JSON.parse(data);
       const { type, role, room, target, payload } = msg;
 
+      // Join room
       if (type === "join-room") {
         if (!room) return ws.send(JSON.stringify({ type: "error", message: "Room required" }));
-        
+
         conn.room = room;
         conn.role = role;
 
         if (!rooms.has(room)) rooms.set(room, { broadcaster: null, listeners: new Set() });
         const r = rooms.get(room);
 
-        // Assign broadcaster
         if (role === "broadcaster") {
           if (r.broadcaster) return ws.send(JSON.stringify({ type: "error", message: "Broadcaster exists" }));
           r.broadcaster = id;
@@ -49,7 +49,6 @@ wss.on("connection", (ws) => {
           return;
         }
 
-        // Assign listener (max 3)
         if (role === "listener") {
           if (r.listeners.size >= 3) return ws.send(JSON.stringify({ type: "error", message: "Room full" }));
           r.listeners.add(id);
@@ -64,8 +63,9 @@ wss.on("connection", (ws) => {
         }
       }
 
-      // WebRTC signaling (offer/answer/candidate)
+      // WebRTC signaling
       if (type === "offer" || type === "answer" || type === "candidate") {
+        if (!target) return;
         const t = conns.get(target);
         if (t) t.ws.send(JSON.stringify({ type, from: id, payload }));
         return;
@@ -90,4 +90,3 @@ wss.on("connection", (ws) => {
 
 const PORT = process.env.PORT || 8080;
 server.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
-
