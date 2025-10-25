@@ -7,10 +7,6 @@ const app = express();
 const server = createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Rooms structure
-// rooms = Map {
-//   roomId => { broadcaster: connId, listeners: Set(connId) }
-// }
 const rooms = new Map();
 const conns = new Map();
 
@@ -19,56 +15,60 @@ app.get("/", (req, res) => {
   res.send("🎧 FM Room Server Active");
 });
 
-// WebSocket connection
 wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
   const conn = { id, ws, role: null, room: null };
   conns.set(id, conn);
-  console.log("🟢 Conn open", id);
+  console.log("🟢 Connection open:", id);
 
   ws.on("message", (data) => {
     try {
       const msg = JSON.parse(data);
-      const { type, role, room, target, payload } = msg;
+      const { type, room, payload, target } = msg;
 
-      // Join room
       if (type === "join-room") {
         if (!room) return ws.send(JSON.stringify({ type: "error", message: "Room required" }));
 
         conn.room = room;
-        conn.role = role;
-
         if (!rooms.has(room)) rooms.set(room, { broadcaster: null, listeners: new Set() });
         const r = rooms.get(room);
 
-        if (role === "broadcaster") {
-          if (r.broadcaster) return ws.send(JSON.stringify({ type: "error", message: "Broadcaster exists" }));
+        // Assign role dynamically
+        if (!r.broadcaster) {
+          conn.role = "broadcaster";
           r.broadcaster = id;
-          ws.send(JSON.stringify({ type: "joined", room, role }));
-          console.log(`Room ${room}: broadcaster joined (${id})`);
-          return;
-        }
-
-        if (role === "listener") {
-          if (r.listeners.size >= 3) return ws.send(JSON.stringify({ type: "error", message: "Room full" }));
+          ws.send(JSON.stringify({ role: "broadcaster" }));
+          console.log(`Room ${room}: broadcaster assigned (${id})`);
+        } else if (r.listeners.size < 3) {
+          conn.role = "listener";
           r.listeners.add(id);
-          ws.send(JSON.stringify({ type: "joined", room, role }));
+          ws.send(JSON.stringify({ role: "listener" }));
           console.log(`Room ${room}: listener joined (${id})`);
-
           // Notify broadcaster
           if (r.broadcaster && conns.has(r.broadcaster)) {
             conns.get(r.broadcaster).ws.send(JSON.stringify({ type: "listener-joined", id }));
           }
-          return;
+        } else {
+          ws.send(JSON.stringify({ type: "error", message: "Room full" }));
         }
+        return;
       }
 
-      // WebRTC signaling
+      // Relay WebRTC signaling
       if (type === "offer" || type === "answer" || type === "candidate") {
         if (!target) return;
         const t = conns.get(target);
         if (t) t.ws.send(JSON.stringify({ type, from: id, payload }));
         return;
+      }
+
+      // Host controls (play/pause/stop/sync)
+      if (type === "control" || type === "sync-time") {
+        if (!conn.role || conn.role !== "broadcaster") return;
+        const r = rooms.get(conn.room);
+        r.listeners.forEach(lid => {
+          if (conns.has(lid)) conns.get(lid).ws.send(JSON.stringify(msg));
+        });
       }
 
     } catch (err) {
@@ -81,10 +81,19 @@ wss.on("connection", (ws) => {
     conns.delete(id);
     if (room && rooms.has(room)) {
       const r = rooms.get(room);
-      if (role === "broadcaster") r.broadcaster = null;
-      if (role === "listener") r.listeners.delete(id);
+      if (role === "broadcaster") {
+        // notify all listeners that host left
+        r.listeners.forEach(lid => {
+          if (conns.has(lid)) conns.get(lid).ws.send(JSON.stringify({ type: "stop" }));
+        });
+        rooms.delete(room);
+        console.log(`Room ${room} closed, broadcaster left`);
+      } else if (role === "listener") {
+        r.listeners.delete(id);
+        console.log(`Listener left room ${room}`);
+      }
     }
-    console.log("🔴 Conn closed", id);
+    console.log("🔴 Connection closed:", id);
   });
 });
 
