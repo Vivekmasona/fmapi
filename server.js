@@ -1,92 +1,176 @@
 import express from "express";
-import { createServer } from "http";
+import http from "http";
 import { WebSocketServer } from "ws";
 import crypto from "crypto";
 
 const app = express();
-const server = createServer(app);
+
+// Root check
+app.get("/", (req, res) => {
+  res.send("🎧 Bihar FM Multi-Room Signaling Server (1 host + 3 listeners max)");
+});
+
+const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Rooms structure
-// rooms = {
-//   roomId1: { broadcaster: connId, listeners: Set(connId) },
-//   roomId2: ...
-// }
+// Structure: { roomId: { host: ws, listeners: Map<id, ws> } }
 const rooms = new Map();
-const conns = new Map();
 
-app.get("/", (req, res) => {
-  res.setHeader("Access-Control-Allow-Origin", "*");
-  res.send("🎧 FM Room Server Active");
-});
-
-wss.on("connection", (ws) => {
-  const id = crypto.randomUUID();
-  const conn = { id, ws, role: null, room: null };
-  conns.set(id, conn);
-  console.log("🟢 Conn open", id);
-
-  ws.on("message", (data) => {
+// Helper to safely send data
+function safeSend(ws, data) {
+  if (ws.readyState === ws.OPEN) {
     try {
-      const msg = JSON.parse(data);
-      const { type, role, room, target, payload } = msg;
+      ws.send(JSON.stringify(data));
+    } catch (e) {
+      console.error("Send error:", e.message);
+    }
+  }
+}
 
-      if (type === "join-room") {
-        if (!room) return ws.send(JSON.stringify({ type: "error", message: "Room required" }));
-        
-        conn.room = room;
-        conn.role = role;
+// Keep connections alive
+setInterval(() => {
+  for (const [, room] of rooms) {
+    if (room.host?.readyState === room.host.OPEN) safeSend(room.host, { type: "ping" });
+    for (const [, l] of room.listeners) {
+      if (l.readyState === l.OPEN) safeSend(l, { type: "ping" });
+    }
+  }
+}, 25000);
 
-        if (!rooms.has(room)) rooms.set(room, { broadcaster: null, listeners: new Set() });
-        const r = rooms.get(room);
+// Handle WS connections
+wss.on("connection", (ws) => {
+  ws.id = crypto.randomUUID();
+  ws.roomId = null;
+  ws.role = null;
+  console.log("🔗 Connected:", ws.id);
 
-        // Assign broadcaster
-        if (role === "broadcaster") {
-          if (r.broadcaster) return ws.send(JSON.stringify({ type: "error", message: "Broadcaster exists" }));
-          r.broadcaster = id;
-          ws.send(JSON.stringify({ type: "joined", room, role }));
-          console.log(`Room ${room}: broadcaster joined (${id})`);
-          return;
+  ws.on("message", (raw) => {
+    let msg;
+    try {
+      msg = JSON.parse(raw.toString());
+    } catch {
+      return;
+    }
+
+    const { type, role, room: roomId, target, payload } = msg;
+
+    // --- Register ---
+    if (type === "register") {
+      ws.role = role;
+      ws.roomId = roomId;
+
+      if (!rooms.has(roomId))
+        rooms.set(roomId, { host: null, listeners: new Map() });
+
+      const room = rooms.get(roomId);
+
+      // --- Host registration ---
+      if (role === "host") {
+        if (room.host) {
+          return safeSend(ws, {
+            type: "error",
+            message: "Room already has a host.",
+          });
         }
 
-        // Assign listener (max 3)
-        if (role === "listener") {
-          if (r.listeners.size >= 3) return ws.send(JSON.stringify({ type: "error", message: "Room full" }));
-          r.listeners.add(id);
-          ws.send(JSON.stringify({ type: "joined", room, role }));
-          console.log(`Room ${room}: listener joined (${id})`);
+        room.host = ws;
+        safeSend(ws, { type: "registered", role: "host", room: roomId });
 
-          // Notify broadcaster
-          if (r.broadcaster && conns.has(r.broadcaster)) {
-            conns.get(r.broadcaster).ws.send(JSON.stringify({ type: "listener-joined", id }));
-          }
-          return;
+        // 🔁 Auto re-offer for already waiting listeners
+        for (const [id, lws] of room.listeners) {
+          safeSend(ws, { type: "listener-joined", id });
+          safeSend(lws, {
+            type: "reoffer",
+            message: "Host joined, please reconnect stream",
+          });
+        }
+
+        console.log(`🎙️ Host joined room: ${roomId}`);
+      }
+
+      // --- Listener registration ---
+      else if (role === "listener") {
+        if (room.listeners.size >= 3) {
+          return safeSend(ws, {
+            type: "error",
+            message: "Room full (max 3 listeners).",
+          });
+        }
+
+        room.listeners.set(ws.id, ws);
+        safeSend(ws, { type: "registered", role: "listener", room: roomId });
+
+        if (room.host) {
+          // Notify host
+          safeSend(room.host, { type: "listener-joined", id: ws.id });
+          console.log(`👂 Listener joined room ${roomId} (connected to host)`);
+        } else {
+          safeSend(ws, { type: "waiting", message: "Waiting for host..." });
+          console.log(`⏳ Listener waiting in room: ${roomId}`);
         }
       }
+      return;
+    }
 
-      // WebRTC signaling (offer/answer/candidate)
-      if (type === "offer" || type === "answer" || type === "candidate") {
-        const t = conns.get(target);
-        if (t) t.ws.send(JSON.stringify({ type, from: id, payload }));
-        return;
+    // --- Signaling (offer/answer/candidate) ---
+    if (["offer", "answer", "candidate"].includes(type)) {
+      const room = rooms.get(ws.roomId);
+      if (!room) return;
+
+      if (ws.role === "host" && target && room.listeners.has(target)) {
+        safeSend(room.listeners.get(target), { type, from: ws.id, payload });
+      } else if (ws.role === "listener" && room.host) {
+        safeSend(room.host, { type, from: ws.id, payload });
       }
+      return;
+    }
 
-    } catch (err) {
-      console.error("❌ Message parse error", err);
+    // --- Metadata (song info) ---
+    if (type === "metadata" && ws.role === "host") {
+      const room = rooms.get(ws.roomId);
+      if (!room) return;
+
+      for (const [, l] of room.listeners) {
+        safeSend(l, {
+          type: "metadata",
+          title: payload.title,
+          artist: payload.artist,
+          cover: payload.cover,
+        });
+      }
     }
   });
 
+  // --- Handle close ---
   ws.on("close", () => {
-    const { room, role } = conn;
-    conns.delete(id);
-    if (room && rooms.has(room)) {
-      const r = rooms.get(room);
-      if (role === "broadcaster") r.broadcaster = null;
-      if (role === "listener") r.listeners.delete(id);
+    const { roomId, role } = ws;
+    if (!roomId || !rooms.has(roomId)) return;
+    const room = rooms.get(roomId);
+
+    if (role === "host") {
+      for (const [, l] of room.listeners) {
+        safeSend(l, { type: "host-left" });
+      }
+      rooms.delete(roomId);
+      console.log(`❌ Host disconnected, room deleted: ${roomId}`);
+    } else if (role === "listener") {
+      room.listeners.delete(ws.id);
+      if (room.host) {
+        safeSend(room.host, { type: "listener-left", id: ws.id });
+      }
+      console.log(`👋 Listener left: ${ws.id}`);
     }
-    console.log("🔴 Conn closed", id);
   });
+
+  ws.on("error", (err) => console.error("WebSocket error:", err.message));
 });
 
-const PORT = process.env.PORT || 8080;
-server.listen(PORT, () => console.log(`✅ Server running on port ${PORT}`));
+// --- Server timeouts ---
+server.keepAliveTimeout = 70000;
+server.headersTimeout = 75000;
+
+// --- Start ---
+const PORT = process.env.PORT || 3000;
+server.listen(PORT, () =>
+  console.log(`✅ Bihar FM Room Server running on port ${PORT}`)
+);
