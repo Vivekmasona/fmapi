@@ -1,47 +1,46 @@
-// ✅ Bihar FM WebRTC Signaling + Room Manager
-// Compatible with Node.js v20+ and CommonJS (no ESM import issues)
-
-const express = require("express");
-const http = require("http");
-const { WebSocketServer } = require("ws");
-const crypto = require("crypto");
+// server.js — Bihar FM WebRTC Signaling + Metadata Relay (Render Compatible)
+import express from "express";
+import http from "http";
+import { WebSocketServer } from "ws";
+import crypto from "crypto";
 
 const app = express();
 
-// Root route (to test Render deployment)
+// Root route check
 app.get("/", (req, res) => {
   res.send("🎧 Bihar FM WebRTC Signaling Server is Live and Ready!");
 });
 
-// HTTP + WS server setup
+// HTTP + WS server
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// All connected clients { id -> { ws, role, room } }
-const clients = new Map();
+// Connected clients
+const clients = new Map(); // id -> { ws, role }
 
+// Safe send helper
 function safeSend(ws, data) {
   if (ws.readyState === ws.OPEN) {
     try {
       ws.send(JSON.stringify(data));
-    } catch (err) {
-      console.error("❌ Send error:", err.message);
+    } catch (e) {
+      console.error("Send error:", e.message);
     }
   }
 }
 
-// 💓 Keep connection alive (for Render/Railway)
+// Keep connections alive
 setInterval(() => {
   for (const [, c] of clients)
     if (c.ws.readyState === c.ws.OPEN)
       safeSend(c.ws, { type: "ping" });
 }, 25000);
 
-// 🛰 WebSocket Events
-wss.on("connection", (ws, req) => {
+// WebSocket handling
+wss.on("connection", (ws) => {
   const id = crypto.randomUUID();
-  clients.set(id, { ws, role: null, room: null });
-  console.log("🔗 New connection:", id);
+  clients.set(id, { ws, role: null });
+  console.log("🔗 Connected:", id);
 
   ws.on("message", (raw) => {
     let msg;
@@ -51,88 +50,63 @@ wss.on("connection", (ws, req) => {
       return;
     }
 
-    const { type, role, room, target, payload } = msg;
+    const { type, role, target, payload } = msg;
 
-    // 🧭 Registration
+    // Register role
     if (type === "register") {
       clients.get(id).role = role;
-      clients.get(id).room = room;
-      console.log(`🧩 ${id} joined room ${room} as ${role}`);
+      console.log(`🧩 ${id} registered as ${role}`);
 
-      // Notify others in room
-      broadcastToRoom(room, {
-        type: "user-joined",
-        id,
-        role,
-        users: listRoomUsers(room),
-      });
+      if (role === "listener") {
+        for (const [, c] of clients)
+          if (c.role === "broadcaster")
+            safeSend(c.ws, { type: "listener-joined", id });
+      }
       return;
     }
 
-    // 💬 Signaling: Offer/Answer/Candidate
+    // Relay signaling
     if (["offer", "answer", "candidate"].includes(type) && target) {
       const t = clients.get(target);
       if (t) safeSend(t.ws, { type, from: id, payload });
       return;
     }
 
-    // 🎵 Metadata updates (title, time sync, etc.)
+    // Broadcast metadata
     if (type === "metadata") {
-      const roomUsers = getRoomClients(clients.get(id).room);
-      for (const u of roomUsers)
-        if (u.role === "listener")
-          safeSend(u.ws, { type: "metadata", payload });
+      console.log(`🎵 Metadata update: ${payload?.title || "Unknown title"}`);
+      for (const [, c] of clients)
+        if (c.role === "listener")
+          safeSend(c.ws, {
+            type: "metadata",
+            title: payload.title,
+            artist: payload.artist,
+            cover: payload.cover,
+          });
       return;
     }
   });
 
   ws.on("close", () => {
-    const c = clients.get(id);
-    if (!c) return;
-    const { room, role } = c;
+    const role = clients.get(id)?.role;
     clients.delete(id);
-    console.log(`❌ ${role || "client"} left room ${room || "none"} (${id})`);
+    console.log(`❌ ${role || "client"} disconnected: ${id}`);
 
-    // Notify others in room
-    broadcastToRoom(room, {
-      type: "user-left",
-      id,
-      users: listRoomUsers(room),
-    });
+    if (role === "listener") {
+      for (const [, c] of clients)
+        if (c.role === "broadcaster")
+          safeSend(c.ws, { type: "peer-left", id });
+    }
   });
 
-  ws.on("error", (err) => console.error("⚠️ WS Error:", err.message));
+  ws.on("error", (err) => console.error("WebSocket error:", err.message));
 });
 
-// 🔄 Utility functions
-function broadcastToRoom(room, data) {
-  if (!room) return;
-  for (const [, c] of clients)
-    if (c.room === room && c.ws.readyState === c.ws.OPEN)
-      safeSend(c.ws, data);
-}
-
-function listRoomUsers(room) {
-  const arr = [];
-  for (const [id, c] of clients)
-    if (c.room === room)
-      arr.push({ id, role: c.role });
-  return arr;
-}
-
-function getRoomClients(room) {
-  const arr = [];
-  for (const [, c] of clients)
-    if (c.room === room)
-      arr.push(c);
-  return arr;
-}
-
-// 🔧 Keep alive timeout config
+// Keep-alive and headers timeout
 server.keepAliveTimeout = 70000;
 server.headersTimeout = 75000;
 
-// 🚀 Start Server
+// Start server
 const PORT = process.env.PORT || 3000;
 server.listen(PORT, () =>
   console.log(`✅ Bihar FM Server running on port ${PORT}`)
