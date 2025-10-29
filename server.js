@@ -1,4 +1,4 @@
-// server.js — FM group signaling with rooms (max 4 per room)
+// server.js — FM group signaling with rooms (max 4 per room) — CommonJS
 const express = require("express");
 const http = require("http");
 const { WebSocketServer } = require("ws");
@@ -11,7 +11,9 @@ app.get("/", (req, res) => {
 });
 
 const server = http.createServer(app);
-const wss = new WebSocketServer({ server });
+
+// Attach WebSocketServer on path /ws
+const wss = new WebSocketServer({ server, path: "/ws" });
 
 // Data structures:
 // clients: id -> { ws, role, name, room }
@@ -30,6 +32,15 @@ function roomMembers(room) {
   return set ? Array.from(set) : [];
 }
 
+function getRoomInfo(room) {
+  const arr = [];
+  for (const id of roomMembers(room)) {
+    const c = clients.get(id);
+    if (c) arr.push({ id, role: c.role, name: c.name || null });
+  }
+  return arr;
+}
+
 // ping to keep-alive
 setInterval(() => {
   for (const [, c] of clients) {
@@ -42,6 +53,9 @@ wss.on("connection", (ws, req) => {
   clients.set(id, { ws, role: null, name: null, room: null });
   console.log("Connected:", id);
 
+  // send back assigned id immediately (helps clients)
+  safeSend(ws, { type: "connected", id });
+
   ws.on("message", (raw) => {
     let msg;
     try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
@@ -50,28 +64,28 @@ wss.on("connection", (ws, req) => {
 
     // Register: expects { type: 'register', role: 'broadcaster'|'listener', room: 'room123', name: 'Bob' }
     if (type === "register") {
-      clients.get(id).role = role || null;
-      clients.get(id).name = name || null;
-      clients.get(id).room = room || null;
+      const info = clients.get(id);
+      info.role = role || null;
+      info.name = name || null;
+      info.room = room || null;
 
       if (room) {
         if (!rooms.has(room)) rooms.set(room, new Set());
         const set = rooms.get(room);
 
-        // limit room size
+        // limit room size to 4
         if (set.size >= 4) {
           safeSend(ws, { type: "room-full", room });
-          // still register but do not add to room
           console.log(`Room ${room} full - ${id} rejected`);
           return;
         }
         set.add(id);
       }
 
-      // reply with id and room members count
-      safeSend(ws, { type: "registered", id, room, members: roomMembers(room).length });
+      // reply with id and full members list
+      safeSend(ws, { type: "registered", id, room, members: getRoomInfo(room) });
 
-      // notify others in room about new presence (so UI can update)
+      // notify others in room about new presence
       if (room) {
         for (const peerId of roomMembers(room)) {
           if (peerId === id) continue;
@@ -93,14 +107,12 @@ wss.on("connection", (ws, req) => {
       if (src.room && tgt.room && src.room === tgt.room) {
         safeSend(tgt.ws, { type, from: id, payload });
       } else {
-        // ignore cross-room signaling
         console.warn("Cross-room signaling blocked", id, target);
       }
       return;
     }
 
     // Control / metadata messages to everyone in the same room (except sender)
-    // Example payloads: { action: 'play', time: 12.34 } or { title: 'Song' }
     if (type === "control" || type === "metadata") {
       const src = clients.get(id);
       if (!src || !src.room) return;
@@ -134,6 +146,8 @@ wss.on("connection", (ws, req) => {
       clients.delete(id);
       return;
     }
+
+    // Unknown types - ignore
   });
 
   ws.on("close", () => {
