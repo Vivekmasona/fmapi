@@ -1,113 +1,165 @@
-// server.js — Bihar FM WebRTC Signaling + Metadata Relay (Render Compatible)
-import express from "express";
-import http from "http";
-import { WebSocketServer } from "ws";
-import crypto from "crypto";
+// server.js — FM group signaling with rooms (max 4 per room)
+const express = require("express");
+const http = require("http");
+const { WebSocketServer } = require("ws");
+const crypto = require("crypto");
 
 const app = express();
 
-// Root route check
 app.get("/", (req, res) => {
-  res.send("🎧 Bihar FM WebRTC Signaling Server is Live and Ready!");
+  res.send("🎧 FM Group Signaling (rooms) is live");
 });
 
-// HTTP + WS server
 const server = http.createServer(app);
 const wss = new WebSocketServer({ server });
 
-// Connected clients
-const clients = new Map(); // id -> { ws, role }
+// Data structures:
+// clients: id -> { ws, role, name, room }
+// rooms: roomId -> Set(clientId)
+const clients = new Map();
+const rooms = new Map();
 
-// Safe send helper
 function safeSend(ws, data) {
-  if (ws.readyState === ws.OPEN) {
-    try {
-      ws.send(JSON.stringify(data));
-    } catch (e) {
-      console.error("Send error:", e.message);
-    }
+  if (ws && ws.readyState === ws.OPEN) {
+    try { ws.send(JSON.stringify(data)); } catch (e) { console.error("send err", e.message); }
   }
 }
 
-// Keep connections alive
+function roomMembers(room) {
+  const set = rooms.get(room);
+  return set ? Array.from(set) : [];
+}
+
+// ping to keep-alive
 setInterval(() => {
-  for (const [, c] of clients)
-    if (c.ws.readyState === c.ws.OPEN)
-      safeSend(c.ws, { type: "ping" });
+  for (const [, c] of clients) {
+    if (c.ws.readyState === c.ws.OPEN) safeSend(c.ws, { type: "ping" });
+  }
 }, 25000);
 
-// WebSocket handling
-wss.on("connection", (ws) => {
+wss.on("connection", (ws, req) => {
   const id = crypto.randomUUID();
-  clients.set(id, { ws, role: null });
-  console.log("🔗 Connected:", id);
+  clients.set(id, { ws, role: null, name: null, room: null });
+  console.log("Connected:", id);
 
   ws.on("message", (raw) => {
     let msg;
-    try {
-      msg = JSON.parse(raw.toString());
-    } catch {
-      return;
-    }
+    try { msg = JSON.parse(raw.toString()); } catch (e) { return; }
 
-    const { type, role, target, payload } = msg;
+    const { type, role, target, payload, room, name } = msg;
 
-    // Register role
+    // Register: expects { type: 'register', role: 'broadcaster'|'listener', room: 'room123', name: 'Bob' }
     if (type === "register") {
-      clients.get(id).role = role;
-      console.log(`🧩 ${id} registered as ${role}`);
+      clients.get(id).role = role || null;
+      clients.get(id).name = name || null;
+      clients.get(id).room = room || null;
 
-      if (role === "listener") {
-        for (const [, c] of clients)
-          if (c.role === "broadcaster")
-            safeSend(c.ws, { type: "listener-joined", id });
+      if (room) {
+        if (!rooms.has(room)) rooms.set(room, new Set());
+        const set = rooms.get(room);
+
+        // limit room size
+        if (set.size >= 4) {
+          safeSend(ws, { type: "room-full", room });
+          // still register but do not add to room
+          console.log(`Room ${room} full - ${id} rejected`);
+          return;
+        }
+        set.add(id);
+      }
+
+      // reply with id and room members count
+      safeSend(ws, { type: "registered", id, room, members: roomMembers(room).length });
+
+      // notify others in room about new presence (so UI can update)
+      if (room) {
+        for (const peerId of roomMembers(room)) {
+          if (peerId === id) continue;
+          const peer = clients.get(peerId);
+          if (peer && peer.ws.readyState === peer.ws.OPEN) {
+            safeSend(peer.ws, { type: "peer-joined", id, role, name });
+          }
+        }
       }
       return;
     }
 
-    // Relay signaling
+    // Relay offer / answer / candidate to a target (if target in same room)
     if (["offer", "answer", "candidate"].includes(type) && target) {
-      const t = clients.get(target);
-      if (t) safeSend(t.ws, { type, from: id, payload });
+      const src = clients.get(id);
+      const tgt = clients.get(target);
+      if (!src || !tgt) return;
+      // ensure same room
+      if (src.room && tgt.room && src.room === tgt.room) {
+        safeSend(tgt.ws, { type, from: id, payload });
+      } else {
+        // ignore cross-room signaling
+        console.warn("Cross-room signaling blocked", id, target);
+      }
       return;
     }
 
-    // Broadcast metadata
-    if (type === "metadata") {
-      console.log(`🎵 Metadata update: ${payload?.title || "Unknown title"}`);
-      for (const [, c] of clients)
-        if (c.role === "listener")
-          safeSend(c.ws, {
-            type: "metadata",
-            title: payload.title,
-            artist: payload.artist,
-            cover: payload.cover,
-          });
+    // Control / metadata messages to everyone in the same room (except sender)
+    // Example payloads: { action: 'play', time: 12.34 } or { title: 'Song' }
+    if (type === "control" || type === "metadata") {
+      const src = clients.get(id);
+      if (!src || !src.room) return;
+      const set = rooms.get(src.room);
+      if (!set) return;
+      for (const peerId of set) {
+        if (peerId === id) continue;
+        const peer = clients.get(peerId);
+        if (peer && peer.ws && peer.ws.readyState === peer.ws.OPEN) {
+          safeSend(peer.ws, { type, from: id, payload });
+        }
+      }
+      return;
+    }
+
+    // Client leaving voluntarily
+    if (type === "leave") {
+      const info = clients.get(id);
+      if (info && info.room) {
+        const set = rooms.get(info.room);
+        if (set) {
+          set.delete(id);
+          // notify remaining in room
+          for (const pid of set) {
+            const p = clients.get(pid);
+            if (p && p.ws.readyState === p.ws.OPEN) safeSend(p.ws, { type: "peer-left", id });
+          }
+          if (set.size === 0) rooms.delete(info.room);
+        }
+      }
+      clients.delete(id);
       return;
     }
   });
 
   ws.on("close", () => {
-    const role = clients.get(id)?.role;
+    const info = clients.get(id);
+    if (!info) return;
+    const { room, role } = info;
     clients.delete(id);
-    console.log(`❌ ${role || "client"} disconnected: ${id}`);
-
-    if (role === "listener") {
-      for (const [, c] of clients)
-        if (c.role === "broadcaster")
-          safeSend(c.ws, { type: "peer-left", id });
+    console.log("Disconnected:", id);
+    if (room) {
+      const set = rooms.get(room);
+      if (set) {
+        set.delete(id);
+        for (const pid of set) {
+          const p = clients.get(pid);
+          if (p && p.ws.readyState === p.ws.OPEN) safeSend(p.ws, { type: "peer-left", id });
+        }
+        if (set.size === 0) rooms.delete(room);
+      }
     }
   });
 
-  ws.on("error", (err) => console.error("WebSocket error:", err.message));
+  ws.on("error", (err) => console.error("WS error:", err && err.message));
 });
 
-// Keep-alive and headers timeout
 server.keepAliveTimeout = 70000;
 server.headersTimeout = 75000;
 
-// Start server
 const PORT = process.env.PORT || 3000;
-server.listen(PORT, () =>
-  console.log(`✅ Bihar FM Server running on port ${PORT}`)
-);
+server.listen(PORT, () => console.log(`FM rooms signaling server on port ${PORT}`));
